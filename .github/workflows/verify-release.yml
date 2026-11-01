@@ -1,0 +1,125 @@
+name: Verify LinkAce Release on GitHub
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify
+        required: false
+        default: v2.6.3
+permissions:
+  contents: read
+concurrency:
+  group: linkace-release-verification
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="$(gh release view --json tagName --jq .tagName)"; fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Download exact Release asset on runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ASSET_NAME="community.lazycat.app.linkace-${RELEASE_TAG}.lpk"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+          gh release view "$RELEASE_TAG" --json tagName,assets > release-metadata.json
+          gh release download "$RELEASE_TAG" --pattern "$ASSET_NAME" --dir verify-pkg
+
+      - name: Verify package contents
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, tarfile, yaml
+
+          tag = os.environ['RELEASE_TAG']
+          name = os.environ['ASSET_NAME']
+          pkg = __import__('pathlib').Path('verify-pkg') / name
+          assert pkg.is_file(), pkg
+
+          h = hashlib.sha256()
+          with pkg.open('rb') as fh:
+              for chunk in iter(lambda: fh.read(1 << 20), b''):
+                  h.update(chunk)
+
+          with tarfile.open(pkg, 'r:') as package:
+              members = package.getnames()
+              for required in ('manifest.yml', 'package.yml', 'content.tar', 'icon.png'):
+                  assert required in members, (required, members)
+
+              info = yaml.safe_load(package.extractfile('package.yml').read())
+              assert info['package'] == 'community.lazycat.app.linkace', info['package']
+              assert info['name'] == 'LinkAce', info['name']
+              assert info['version'] == tag.lstrip('v'), (info['version'], tag)
+              assert info['license'] == 'GPL-3.0', info['license']
+              assert info['min_os_version'] == '1.5.0', info['min_os_version']
+
+              m = yaml.safe_load(package.extractfile('manifest.yml').read())
+              app = m['application']
+              assert app['subdomain'] == 'linkace', app['subdomain']
+              ups = app['upstreams']
+              assert any(u['location'] == '/' and u['backend'] == 'http://app:80/' for u in ups), ups
+
+              svcs = m['services']
+              assert set(svcs) == {'app', 'db', 'meilisearch', 'redis'}, set(svcs)
+
+              appsvc = svcs['app']
+              assert 'linkace/linkace' in appsvc['image'], appsvc['image']
+              assert appsvc['image'].endswith(':' + tag), appsvc['image']
+
+              env = ' '.join(appsvc['environment'])
+              assert 'DB_CONNECTION=mysql' in env
+              assert 'APP_SEARCH_DRIVER=meilisearch' in env
+              assert 'REDIS_HOST=redis' in env
+              assert 'stable_secret' in env, env
+              # no upstream placeholder secrets may survive
+              for bad in ('ChangeThisToASecurePassword', 'REPLACE_WITH', 'someRandomStringWith32Characters'):
+                  assert bad not in env, bad
+
+              # no .env written into the container
+              binds = ' '.join(appsvc.get('binds') or [])
+              assert '.env' not in binds, binds
+
+              db = svcs['db']
+              assert 'mariadb:12.0' in db['image'], db['image']
+              assert 'healthcheck' in db
+              assert 'stable_secret' in ' '.join(db['environment'])
+
+              meili = svcs['meilisearch']
+              assert 'meilisearch:v1.16' in meili['image'], meili['image']
+              assert 'stable_secret' in ' '.join(meili['environment'])
+
+              redis = svcs['redis']
+              assert 'redis:8.2' in redis['image'], redis['image']
+
+              # app must not add a healthcheck or a startup gate
+              assert 'healthcheck' not in appsvc, appsvc
+              text = package.extractfile('manifest.yml').read().decode()
+              assert 'lzc-file-chooser' not in text
+              assert 'deploy_params.yml' not in members, members
+
+              with tarfile.open(fileobj=package.extractfile('content.tar')) as content:
+                  cmembers = content.getnames()
+                  lic = [n for n in cmembers if 'licenses/' in n]
+                  assert lic, cmembers
+                  license_text = content.extractfile(lic[0]).read().decode()
+              assert 'GNU GENERAL PUBLIC LICENSE' in license_text
+
+          result = {
+              'verified': True,
+              'tag': tag,
+              'sha256': h.hexdigest(),
+              'size': pkg.stat().st_size,
+              'runtime_tested': False,
+          }
+          print(json.dumps(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
