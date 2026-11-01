@@ -1,0 +1,128 @@
+application:
+  subdomain: linkace
+  multi_instance: false
+  upstreams:
+    - location: /package-licenses/
+      backend: file:///lzcapp/pkg/content/licenses/
+    - location: /
+      backend: http://app:80/
+
+services:
+  db:
+    image: docker.1ms.run/library/mariadb:12.0
+    environment:
+      - MYSQL_ROOT_PASSWORD={{ stable_secret "linkace_db_password" | replace "\r" "" | replace "\n" "" }}
+      - MYSQL_USER=linkace
+      - |-
+        MYSQL_PASSWORD={{ stable_secret "linkace_db_password" | replace "\r" "" | replace "\n" "" }}
+      - MYSQL_DATABASE=linkace
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mariadb-admin ping -h 127.0.0.1 -u root -p"$$MYSQL_ROOT_PASSWORD"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    binds:
+      - /lzcapp/var/db:/var/lib/mysql
+
+  meilisearch:
+    image: docker.1ms.run/getmeili/meilisearch:v1.16
+    environment:
+      - MEILI_ENV=production
+      - MEILI_NO_ANALYTICS=true
+      - |-
+        MEILI_MASTER_KEY={{ stable_secret "linkace_meili_key" | replace "\r" "" | replace "\n" "" }}
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -fsS
+        - http://127.0.0.1:7700/health
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    binds:
+      - /lzcapp/var/meili:/meili_data
+
+  redis:
+    image: docker.1ms.run/library/redis:8.2
+    command:
+      - redis-server
+      - --requirepass
+      - |-
+        {{ stable_secret "linkace_redis_password" | replace "\r" "" | replace "\n" "" }}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    environment:
+      - |-
+        REDIS_PASSWORD={{ stable_secret "linkace_redis_password" | replace "\r" "" | replace "\n" "" }}
+
+  app:
+    # upstream: linkace/linkace:v2.6.3
+    image: docker.1ms.run/linkace/linkace:v2.6.3
+    depends_on:
+      - db
+      - meilisearch
+      - redis
+    environment:
+      - APP_NAME=LinkAce
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - |-
+        APP_KEY={{ stable_secret "linkace_app_key" | replace "\r" "" | replace "\n" "" }}
+      - |-
+        APP_URL=https://{{ .S.AppDomain }}
+      - TRUSTED_PROXIES=*
+      - DB_CONNECTION=mysql
+      - DB_HOST=db
+      - DB_PORT=3306
+      - DB_DATABASE=linkace
+      - DB_USERNAME=linkace
+      - |-
+        DB_PASSWORD={{ stable_secret "linkace_db_password" | replace "\r" "" | replace "\n" "" }}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - |-
+        REDIS_PASSWORD={{ stable_secret "linkace_redis_password" | replace "\r" "" | replace "\n" "" }}
+      - SESSION_DRIVER=redis
+      - CACHE_STORE=redis
+      - QUEUE_CONNECTION=redis
+      - APP_SEARCH_DRIVER=meilisearch
+      - MEILISEARCH_HOST=http://meilisearch:7700
+      - |-
+        MEILISEARCH_KEY={{ stable_secret "linkace_meili_key" | replace "\r" "" | replace "\n" "" }}
+      - LOG_CHANNEL=stack
+      - LOG_LEVEL=warning
+      - TZ=Asia/Shanghai
+    binds:
+      - /lzcapp/var/app-storage:/app/storage
+
+usage: |
+  LinkAce 是自建的网址收藏库：收藏链接、打标签、分列表，支持全文检索，还能定期检查链接是否失效。
+
+  使用方法：
+  1. 打开应用，会进入安装向导，填写管理员邮箱和密码，创建第一个账号。
+  2. 粘贴网址即可收藏；用标签和列表归类。
+  3. 在设置里可以开启链接健康检查，定期自动检测失效链接。
+
+  数据与安全：
+  - 数据库在 MariaDB（/lzcapp/var/db），搜索索引在 /lzcapp/var/meili，应用存储（缩略图、备份）在 /lzcapp/var/app-storage。
+    卸载应用会一并删除，请定期备份。
+  - 数据库密码、Redis 密码、Meilisearch 密钥与应用密钥全部由平台稳定密钥生成，每个部署不同，不写成固定值。
+  - 本包不预置任何账号或默认口令，管理员账号由安装向导创建。
+  - 应用经懒猫入口鉴权访问。
+
+  说明：
+  - 本应用包含四个容器（应用本体 + MariaDB + Meilisearch + Redis），启动顺序由依赖关系保证。
+  - 应用配置通过环境变量注入，未使用 .env 文件。
+  - 未配置邮件服务，邀请成员、找回密码等依赖邮件的功能不可用。
+  - 未做真机验证：安装向导、登录、收藏与检索、链接检查以及重启后持久化均未在设备上实测。
