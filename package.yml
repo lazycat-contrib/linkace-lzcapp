@@ -1,6 +1,6 @@
 package: community.lazycat.app.linkace
 name: LinkAce
-version: 0.0.0
+version: 2.6.3
 description: "Self-hosted bookmark archive with tags, lists, full-text search and automatic link checks."
 min_os_version: "1.5.0"
 homepage: https://github.com/Kovah/LinkAce
